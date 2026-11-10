@@ -30,6 +30,35 @@ Method override headers will also be respected. For example, if a server support
 ```
 :::
 
+## Invalidate After Unsafe Requests
+By default, requests-cache never modifies or removes cached entries in response to write
+operations. If a `POST`, `PUT`, `PATCH`, or `DELETE` request changes a resource on the origin,
+previously cached representations of that resource can therefore become stale.
+
+Set `unsafe_method_invalidation=True` to invalidate the affected cache entries after a successful
+unsafe-method response, following [RFC 9111 section 4.4](https://www.rfc-editor.org/rfc/rfc9111#section-4.4):
+```python
+>>> session = CachedSession(unsafe_method_invalidation=True)
+>>> session.get('https://example.com/items/1')  # Cached
+>>> session.put('https://example.com/items/1', json={'name': 'new'})
+>>> session.get('https://example.com/items/1')  # Fetched from the origin again
+```
+
+The invalidated set consists of:
+- The effective request URI of the unsafe request
+- Same-origin URIs referenced by the response's `Location` and `Content-Location` headers
+
+Relative URI references are resolved against the response's effective URI, and cross-origin
+references are ignored so that another site's cache entries can never be removed. Every stored
+representation associated with those URIs is removed, including `GET`/`HEAD` entries, `Vary`
+variants, and cached redirect aliases pointing at them.
+
+Invalidation only runs after a successful (2xx) response; redirects, client errors, and server
+errors leave the cache untouched. If the request fails at the network level before any response is
+received, only the effective request URI is invalidated. The unsafe-method response itself does
+not need to be cached, so this also applies when its headers (for example `Cache-Control:
+no-store`) or the configured filters prevent storing it.
+
 ## Filter by Status Codes
 To cache additional status codes, specify them with `allowable_codes`
 ```python

@@ -22,5 +22,6 @@ HeaderDict = Mapping[str, str]
 
 from .expiration import *
 from .settings import *
+from .invalidation import *
 from .directives import CacheDirectives, set_request_headers
 from .actions import CacheActions

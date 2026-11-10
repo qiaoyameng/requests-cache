@@ -23,6 +23,9 @@ from .policy import (
     ExpirationTime,
     FilterCallback,
     KeyCallback,
+    get_invalidation_urls,
+    is_successful_invalidation_status,
+    is_unsafe_method,
     set_request_headers,
 )
 from .serializers import SerializerType
@@ -59,6 +62,7 @@ class CacheMixin(MIXIN_BASE):
         key_fn: Optional[KeyCallback] = None,
         read_only: bool = False,
         stale_if_error: Union[bool, int] = False,
+        unsafe_method_invalidation: bool = False,
         autoclose: bool = True,
         **kwargs,
     ):
@@ -77,6 +81,7 @@ class CacheMixin(MIXIN_BASE):
             key_fn=key_fn,
             read_only=read_only,
             stale_if_error=stale_if_error,
+            unsafe_method_invalidation=unsafe_method_invalidation,
             autoclose=autoclose,
             **kwargs,
         )
@@ -278,8 +283,17 @@ class CacheMixin(MIXIN_BASE):
         If applicable, also handle conditional requests.
         """
         request = actions.update_request(request)
-        response = super().send(request, **kwargs)
+        try:
+            response = super().send(request, **kwargs)
+        except Exception as err:
+            self._invalidate_after_unsafe_failure(request)
+            raise err
         actions.update_from_response(response)
+
+        # RFC 9111 section 4.4: a successful response to an unsafe request invalidates the
+        # affected same-origin representations, independently of whether the response itself
+        # is written to the cache
+        self._invalidate_after_unsafe_response(request, response)
 
         if not actions.skip_write:
             self.cache.save_response(response, actions.cache_key, actions.expires)
@@ -300,6 +314,37 @@ class CacheMixin(MIXIN_BASE):
             return response
         else:
             return OriginalResponse.wrap_response(response, actions)
+
+    def _invalidate_after_unsafe_response(
+        self, request: PreparedRequest, response: AnyResponse
+    ) -> None:
+        """Invalidate affected cache entries after a successful unsafe-method response"""
+        if not self.settings.unsafe_method_invalidation or not is_unsafe_method(request):
+            return
+        if not is_successful_invalidation_status(response.status_code):
+            logger.debug(
+                f'Skipping invalidation for status {response.status_code} '
+                f'(not a 2xx successful response); URL: {request.url}'
+            )
+            return
+        urls = get_invalidation_urls(request, response)
+        self.cache.invalidate_urls(urls)
+
+    def _invalidate_after_unsafe_failure(self, request: PreparedRequest) -> None:
+        """Invalidate the effective request URI when an unsafe request could not complete.
+
+        A network-level failure means the origin did not provide a response, so no
+        ``Location``/``Content-Location`` URIs can be considered. Only the effective request URI
+        is invalidated, and the rest of the cache is preserved.
+        """
+        if not self.settings.unsafe_method_invalidation or not is_unsafe_method(request):
+            return
+        logger.warning(
+            f'Unsafe request for URL {request.url} failed; invalidating its cached '
+            'representations',
+            exc_info=True,
+        )
+        self.cache.invalidate_urls(get_invalidation_urls(request, None))
 
     def _resend(
         self,
@@ -411,6 +456,11 @@ class CachedSession(CacheMixin, OriginalSession):
             accepts a time value representing maximum staleness to accept.
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
+        unsafe_method_invalidation: After a successful (2xx) response to an unsafe request
+            (POST, PUT, PATCH, DELETE), invalidate cached representations for the effective
+            request URI and any same-origin URIs in the response's ``Location`` and
+            ``Content-Location`` headers, per RFC 9111 section 4.4. The unsafe-method response
+            itself is not required to be cached.
         autoclose: Close the cache backend when the session is closed
         filter_fn: Response filtering function that indicates whether or not a given response should
             be cached. See :ref:`custom-filtering` for details.

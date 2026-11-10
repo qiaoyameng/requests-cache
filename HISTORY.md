@@ -1,6 +1,10 @@
 # History
 
 ## Unreleased
+* Add `unsafe_method_invalidation` option to invalidate cached representations after a successful
+unsafe-method (POST/PUT/PATCH/DELETE) response, following RFC 9111 section 4.4. The invalidated
+set covers the effective request URI plus same-origin `Location`/`Content-Location` URIs, including
+Vary variants and redirect aliases; cross-origin references and non-2xx responses are ignored.
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

@@ -344,6 +344,41 @@ class BaseCacheTest:
         for _ in range(5):
             assert session.post(httpbin('post'), files={'file1': BytesIO(b'10' * 1024)}).from_cache
 
+    def test_invalidate_urls(self):
+        """invalidate_urls removes GET/HEAD entries, Vary variants, and redirect aliases for the
+        given URIs, while leaving unrelated entries cached. Runs for every backend."""
+        from tests.conftest import (
+            MOCKED_URL,
+            MOCKED_URL_REDIRECT,
+            MOCKED_URL_REDIRECT_TARGET,
+            MOCKED_URL_VARY,
+        )
+
+        session = self.init_session()
+        session = mount_mock_adapter(session)
+
+        # A plain representation, a Vary variant pair, and a redirect alias
+        session.get(MOCKED_URL)
+        session.head(MOCKED_URL)
+        session.get(MOCKED_URL_VARY, headers={'Accept': 'text/plain'})
+        session.get(MOCKED_URL_VARY, headers={'Accept': 'application/json'})
+        session.get(MOCKED_URL_REDIRECT)
+        assert session.cache.contains(url=MOCKED_URL)
+        assert session.cache.contains(url=MOCKED_URL_VARY)
+        assert session.cache.contains(url=MOCKED_URL_REDIRECT)
+
+        session.cache.invalidate_urls([MOCKED_URL, MOCKED_URL_VARY, MOCKED_URL_REDIRECT_TARGET])
+
+        assert not session.cache.contains(url=MOCKED_URL)
+        assert not session.cache.contains(url=MOCKED_URL_VARY)
+        assert not session.cache.contains(url=MOCKED_URL_REDIRECT)
+        assert not session.cache.contains(url=MOCKED_URL_REDIRECT_TARGET)
+
+        # Refetched entries come from the origin, not from a stale representation
+        assert session.get(MOCKED_URL).from_cache is False
+        vary_response = session.get(MOCKED_URL_VARY, headers={'Accept': 'text/plain'})
+        assert vary_response.from_cache is False
+
     def test_delete__expired(self):
         session = self.init_session(expire_after=1)
 

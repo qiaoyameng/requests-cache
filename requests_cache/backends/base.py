@@ -19,7 +19,7 @@ from pathlib import Path
 
 from requests import Request, Response
 
-from ..cache_keys import create_key, redact_response
+from ..cache_keys import create_key, normalize_url, redact_response
 from ..models import AnyRequest, CachedResponse
 from ..policy import DEFAULT_CACHE_NAME, CacheSettings, ExpirationTime
 from ..serializers import SerializerType, init_serializer
@@ -202,6 +202,67 @@ class BaseCache:
         else:
             self.responses.bulk_delete(delete_keys)
         self._prune_redirects()
+
+    def invalidate_urls(self, urls: Iterable[str]) -> List[str]:
+        """Invalidate cached representations associated with the specified URIs.
+
+        This implements the storage side of RFC 9111 section 4.4 invalidation. Unlike
+        :meth:`delete`, it removes every stored representation related to each URI rather than a
+        single default cache key, including:
+
+        * GET and HEAD representations
+        * Vary and ``match_headers`` variants stored under different keys for the same URI
+        * Responses reachable through cached redirect aliases whose history contains the URI
+
+        Only entries associated with the given URIs are removed; unrelated entries and entries
+        for other origins are left untouched. Storage errors are propagated instead of being
+        treated as a completed invalidation.
+
+        Args:
+            urls: Absolute URIs whose representations should be invalidated
+
+        Returns:
+            The cache keys that were submitted for deletion
+        """
+        ignored_parameters = self._settings.ignored_parameters
+        normalized_targets = {
+            normalize_url(url, ignored_parameters) for url in urls if url
+        }
+        normalized_targets.discard('')
+        if not normalized_targets:
+            return []
+
+        # Direct keys for the default GET/HEAD representations
+        delete_keys: List[str] = [
+            self.create_key(Request(method, url).prepare())
+            for method in ('GET', 'HEAD')
+            for url in normalized_targets
+        ]
+
+        # Scan stored responses so that Vary variants and entries behind redirect aliases are
+        # removed as well, regardless of the exact key they were stored under
+        for key in list(self.responses.keys()):
+            response = self.get_response(key)
+            if response is None:
+                continue
+            response_urls = [response.url, response.request.url]
+            response_urls += [redirect.url for redirect in response.history]
+            response_urls += [redirect.request.url for redirect in response.history]
+            if any(
+                response_url
+                and normalize_url(response_url, ignored_parameters) in normalized_targets
+                for response_url in response_urls
+            ):
+                delete_keys.append(key)
+
+        delete_keys = list(dict.fromkeys(delete_keys))
+        logger.debug(
+            f'Invalidating {len(delete_keys)} cached response(s) '
+            f'for {len(normalized_targets)} URI(s)'
+        )
+        self.responses.bulk_delete(delete_keys)
+        self._prune_redirects()
+        return delete_keys
 
     def _prune_redirects(self):
         """Remove any redirects that no longer point to an existing response"""
