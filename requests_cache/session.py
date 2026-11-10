@@ -12,11 +12,13 @@ from requests.hooks import dispatch_hook
 from ._utils import get_valid_kwargs, patch_form_boundary
 from .backends import BackendSpecifier, StrOrPath, init_backend
 from .models import AnyResponse, CachedResponse, OriginalResponse
+from .models.stream_cache import ConsumedStreamRecorder
 from .policy import (
     DEFAULT_CACHE_NAME,
     DEFAULT_IGNORED_PARAMS,
     DEFAULT_METHODS,
     DEFAULT_STATUS_CODES,
+    DEFAULT_STREAM_CACHE_MEMORY_THRESHOLD,
     CacheActions,
     CacheSettings,
     ExpirationPatterns,
@@ -60,6 +62,8 @@ class CacheMixin(MIXIN_BASE):
         read_only: bool = False,
         stale_if_error: Union[bool, int] = False,
         autoclose: bool = True,
+        stream_cache: bool = False,
+        stream_cache_memory_threshold: int = DEFAULT_STREAM_CACHE_MEMORY_THRESHOLD,
         **kwargs,
     ):
         self.cache = init_backend(cache_name, backend, serializer=serializer, **kwargs)
@@ -78,6 +82,8 @@ class CacheMixin(MIXIN_BASE):
             read_only=read_only,
             stale_if_error=stale_if_error,
             autoclose=autoclose,
+            stream_cache=stream_cache,
+            stream_cache_memory_threshold=stream_cache_memory_threshold,
             **kwargs,
         )
         self._lock = RLock()
@@ -282,7 +288,24 @@ class CacheMixin(MIXIN_BASE):
         actions.update_from_response(response)
 
         if not actions.skip_write:
-            self.cache.save_response(response, actions.cache_key, actions.expires)
+            stream = kwargs.get('stream', self.stream)
+            if (
+                self.settings.stream_cache
+                and stream
+                and not response._content_consumed
+                and getattr(response, 'raw', None) is not None
+            ):
+                # Consumption-driven caching: return response headers immediately, record the
+                # body as the caller reads it, and publish to the cache once fully consumed
+                response.raw = ConsumedStreamRecorder(
+                    response,
+                    self.cache,
+                    actions.cache_key,
+                    actions.expires,
+                    self.settings.stream_cache_memory_threshold,
+                )
+            else:
+                self.cache.save_response(response, actions.cache_key, actions.expires)
         elif cached_response is not None and response.status_code == 304:
             cached_response = actions.update_revalidated_response(
                 response, CachedResponse.from_response(cached_response)
@@ -412,6 +435,11 @@ class CachedSession(CacheMixin, OriginalSession):
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
         autoclose: Close the cache backend when the session is closed
+        stream_cache: For requests made with ``stream=True``, cache the response incrementally as
+            it is consumed, instead of reading the entire body up front. The cache entry is
+            published only after the response has been fully read.
+        stream_cache_memory_threshold: Maximum number of body bytes to buffer in memory while
+            staging a streamed response; larger bodies are staged in a temporary file
         filter_fn: Response filtering function that indicates whether or not a given response should
             be cached. See :ref:`custom-filtering` for details.
         key_fn: Request matching function for generating custom cache keys. See

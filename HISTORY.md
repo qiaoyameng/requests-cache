@@ -1,6 +1,10 @@
 # History
 
 ## Unreleased
+* Add `stream_cache` option to cache streamed (`stream=True`) responses incrementally as they are
+  consumed, instead of reading the entire body up front; the cache entry is published only after
+  the response is fully read, and `stream_cache_memory_threshold` controls when the staged body
+  spills over from memory to a temporary file
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

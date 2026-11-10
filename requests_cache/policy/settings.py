@@ -10,6 +10,7 @@ ALL_METHODS = ('GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE')
 DEFAULT_CACHE_NAME = 'http_cache'
 DEFAULT_METHODS = ('GET', 'HEAD')
 DEFAULT_STATUS_CODES = (200,)
+DEFAULT_STREAM_CACHE_MEMORY_THRESHOLD = 1024 * 1024
 
 # Common auth headers and params that are excluded from cache keys and redacted from cached responses
 AUTH_HEADERS = (
@@ -48,6 +49,8 @@ class CacheSettings(RichMixin):
     read_only: bool = field(default=False)
     stale_if_error: Union[bool, ExpirationTime] = field(default=False)
     stale_while_revalidate: Union[bool, ExpirationTime] = field(default=False)
+    stream_cache: bool = field(default=False)
+    stream_cache_memory_threshold: int = field(default=DEFAULT_STREAM_CACHE_MEMORY_THRESHOLD)
     urls_expire_after: Dict[ExpirationPattern, ExpirationTime] = field(factory=dict)
 
     @classmethod
