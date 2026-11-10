@@ -1,6 +1,7 @@
 # History
 
 ## Unreleased
+* Add opt-in `head_updates_get` setting: 200 responses to `HEAD` requests can update the headers and freshness of a cached complete `GET` representation for the same target URI and matching `Vary` request headers, while keeping the cached body unchanged. Conflicting validators or `Content-Length` mark the cached representation expired instead (RFC 9111, sections 3.4 and 4.3.5)
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

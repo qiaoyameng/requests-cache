@@ -2,7 +2,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
-from requests import PreparedRequest, Request
+from requests import PreparedRequest, Request, Response
 from requests.cookies import RequestsCookieJar
 
 from requests_cache.cache_keys import create_key
@@ -666,3 +666,153 @@ def test_ignored_headers(directive):
     assert actions.expire_after == 1
     assert actions.skip_read is False
     assert actions.skip_write is False
+
+
+# RFC 9111 sections 3.4 and 4.3.5: HEAD updates of cached GET representations
+# ----------------------------------------------------------------------------
+
+HEAD_TARGET_URL = 'https://img.site.com/base/img.jpg'
+
+
+def _head_actions(expire_after=100) -> CacheActions:
+    request = Request(method='HEAD', url=HEAD_TARGET_URL).prepare()
+    return CacheActions.from_request('head-key', request, CacheSettings(expire_after=expire_after))
+
+
+def _cached_get(headers, body=b'cached body', **kwargs) -> CachedResponse:
+    cached = CachedResponse(
+        url=HEAD_TARGET_URL,
+        status_code=200,
+        headers=headers,
+        request=CachedRequest(method='GET', url=HEAD_TARGET_URL),
+        expires=utcnow() + timedelta(seconds=30),
+        **kwargs,
+    )
+    cached._content = body
+    return cached
+
+
+def _head_response(status_code=200, headers=None) -> Response:
+    response = Response()
+    response.status_code = status_code
+    response.headers = headers or {}
+    response.request = Request(method='HEAD', url=HEAD_TARGET_URL).prepare()
+    response._content = b''
+    return response
+
+
+def test_head_update_matching_etag_merges_headers_and_keeps_body():
+    from requests_cache.policy.actions import HEAD_UPDATED
+
+    cached = _cached_get({'ETag': ETAG, 'Content-Length': '11', 'X-Old': '1'})
+    actions = _head_actions()
+    head = _head_response(
+        headers={'ETag': ETAG, 'Content-Length': '11', 'X-New': '2', 'Connection': 'keep-alive'}
+    )
+
+    result = actions.update_cached_get_from_head(head, cached)
+
+    assert result == HEAD_UPDATED
+    assert cached.content == b'cached body'
+    assert cached.headers['X-New'] == '2'
+    assert cached.headers['X-Old'] == '1'
+    # Representation body metadata and hop-by-hop headers from the cached response are retained
+    assert cached.headers['Content-Length'] == '11'
+    assert 'Connection' not in cached.headers
+    assert cached.revalidated is True
+
+
+def test_head_update_changed_etag_conflicts_without_header_merge():
+    from requests_cache.policy.actions import HEAD_CONFLICT
+
+    cached = _cached_get({'ETag': ETAG, 'Content-Length': '11'})
+    original_expires = cached.expires
+    actions = _head_actions()
+    head = _head_response(headers={'ETag': '"different"', 'Content-Length': '11', 'X-New': '2'})
+
+    result = actions.update_cached_get_from_head(head, cached)
+
+    assert result == HEAD_CONFLICT
+    assert cached.is_expired is True
+    assert cached.headers.get('ETag') == ETAG
+    assert 'X-New' not in cached.headers
+    assert cached.content == b'cached body'
+    assert cached.expires != original_expires
+
+
+def test_head_update_content_length_conflicts_even_with_matching_etag():
+    from requests_cache.policy.actions import HEAD_CONFLICT
+
+    cached = _cached_get({'ETag': ETAG}, body=b'cached body')
+    actions = _head_actions()
+    head = _head_response(headers={'ETag': ETAG, 'Content-Length': '999'})
+
+    assert actions.update_cached_get_from_head(head, cached) == HEAD_CONFLICT
+    assert cached.is_expired is True
+    assert cached.content == b'cached body'
+
+
+def test_head_update_without_validators_is_noop():
+    from requests_cache.policy.actions import HEAD_NO_OP
+
+    cached = _cached_get({'Content-Length': '11'})
+    original_expires = cached.expires
+    actions = _head_actions()
+    head = _head_response(headers={'Content-Length': '11', 'X-New': '2'})
+
+    assert actions.update_cached_get_from_head(head, cached) == HEAD_NO_OP
+    assert cached.expires == original_expires
+    assert 'X-New' not in cached.headers
+    assert cached.content == b'cached body'
+
+
+def test_head_update_non_200_status_is_noop():
+    from requests_cache.policy.actions import HEAD_NO_OP
+
+    cached = _cached_get({'ETag': ETAG})
+    original_expires = cached.expires
+    actions = _head_actions()
+    head = _head_response(status_code=500, headers={'ETag': ETAG})
+
+    assert actions.update_cached_get_from_head(head, cached) == HEAD_NO_OP
+    assert cached.expires == original_expires
+    assert cached.revalidated is False
+
+
+def test_head_update_last_modified_agreement_validates():
+    from requests_cache.policy.actions import HEAD_UPDATED
+
+    cached = _cached_get({'Last-Modified': LAST_MODIFIED, 'Content-Length': '11'})
+    actions = _head_actions()
+    head = _head_response(
+        headers={'Last-Modified': LAST_MODIFIED, 'Content-Length': '11', 'X-New': 'lm'}
+    )
+
+    assert actions.update_cached_get_from_head(head, cached) == HEAD_UPDATED
+    assert cached.headers['X-New'] == 'lm'
+    assert cached.content == b'cached body'
+
+
+def test_head_update_vary_mismatch_is_noop():
+    from requests_cache.policy.actions import HEAD_NO_OP
+
+    cached = _cached_get(
+        {'ETag': ETAG, 'Vary': 'Accept'},
+    )
+    cached.request = CachedRequest(
+        method='GET',
+        url=HEAD_TARGET_URL,
+        headers={'Accept': 'application/json'},
+    )
+    head_request = Request(
+        method='HEAD', url=HEAD_TARGET_URL, headers={'Accept': 'text/html'}
+    ).prepare()
+    actions = CacheActions.from_request('head-key', head_request, CacheSettings(expire_after=100))
+    head = _head_response(headers={'ETag': ETAG})
+
+    original_expires = cached.expires
+    assert (
+        actions.update_cached_get_from_head(head, cached, create_key) == HEAD_NO_OP
+    )
+    assert cached.expires == original_expires
+    assert cached.content == b'cached body'

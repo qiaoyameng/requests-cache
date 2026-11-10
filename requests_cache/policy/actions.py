@@ -1,3 +1,4 @@
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 from logging import DEBUG, getLogger
 from typing import TYPE_CHECKING, Dict, List, Mapping, MutableMapping, Optional, Union
@@ -34,6 +35,26 @@ METHOD_OVERRIDE_HEADERS = [
 ]
 
 logger = getLogger(__name__)
+
+# Result values for CacheActions.update_cached_get_from_head()
+HEAD_UPDATED = 'updated'
+HEAD_CONFLICT = 'conflict'
+HEAD_NO_OP = 'no-op'
+
+# Hop-by-hop headers (RFC 9111, section 7.1.3); these describe the transport of the HEAD
+# response rather than the representation, so they must not be merged into a cached GET response
+HOP_BY_HOP_HEADERS = frozenset(
+    [
+        'connection',
+        'keep-alive',
+        'proxy-authenticate',
+        'proxy-authorization',
+        'te',
+        'trailer',
+        'transfer-encoding',
+        'upgrade',
+    ]
+)
 
 
 @define(repr=False)
@@ -306,6 +327,157 @@ class CacheActions(RichMixin):
         cached_response.has_content_changed = False
         return cached_response
 
+    def update_cached_get_from_head(
+        self,
+        head_response: Response,
+        cached_get: 'CachedResponse',
+        create_key: Optional[KeyCallback] = None,
+        **key_kwargs,
+    ) -> str:
+        """Update a cached full GET representation from a 200 HEAD response (RFC 9111, sections
+        3.4 and 4.3.5).
+
+        The cached GET response must already be associated with the same target URI and a
+        matching set of request headers selected by ``Vary``. A 200 HEAD response may update the
+        cached response's header fields and freshness, but its (empty) payload must never replace
+        the cached GET body.
+
+        Returns one of:
+
+        * ``HEAD_UPDATED``: Validators and any ``Content-Length`` agree; updatable response
+          headers were merged and freshness was recomputed.
+        * ``HEAD_CONFLICT``: The evidence is inconsistent (a mismatched validator or
+          ``Content-Length``); the cached GET response was marked expired and left otherwise
+          untouched.
+        * ``HEAD_NO_OP``: Not enough evidence to act on (for example, no validators), or the
+          responses do not represent the same selection. No state was changed.
+        """
+        if head_response.status_code != 200 or cached_get is None:
+            return HEAD_NO_OP
+
+        # Only representations selected by the same target URI and Vary request headers may be
+        # associated; a non-matching Vary variant must not affect the cached GET response
+        if create_key and not self._vary_headers_match(cached_get, create_key, **key_kwargs)[0]:
+            logger.debug(
+                f'HEAD response for {head_response.request.url} does not match cached GET '
+                'Vary selection; not updating'
+            )
+            return HEAD_NO_OP
+
+        head_headers = CaseInsensitiveDict(head_response.headers)
+        cached_headers = cached_get.headers
+
+        if self._head_evidence_conflicts(head_headers, cached_get):
+            logger.info(
+                f'HEAD response for {head_response.request.url} conflicts with cached GET '
+                'representation; marking cached response expired'
+            )
+            # Invalidate the stale representation without touching its body or other metadata
+            cached_get.expires = utcnow()
+            return HEAD_CONFLICT
+
+        # A successful validation requires at least one validator that agrees with the cached
+        # representation; without such evidence the conservative behavior is to do nothing
+        if not self._head_validators_agree(head_headers, cached_headers):
+            logger.debug(
+                f'HEAD response for {head_response.request.url} lacks matching validators; '
+                'not updating cached GET response'
+            )
+            return HEAD_NO_OP
+
+        self._merge_head_headers(head_headers, cached_headers)
+        cached_get.expires = self.expires
+        cached_get.revalidated = True
+        cached_get.has_content_changed = False
+        logger.debug(
+            f'Updated headers and freshness of cached GET response for '
+            f'{head_response.request.url} from HEAD response'
+        )
+        return HEAD_UPDATED
+
+    @staticmethod
+    def _head_evidence_conflicts(
+        head_headers: CaseInsensitiveDict, cached_get: 'CachedResponse'
+    ) -> bool:
+        """Check whether the HEAD 200 response contains evidence contradicting the cached GET
+        representation. Only evidence present on both sides can produce a conflict; missing
+        values are treated conservatively as inconclusive.
+        """
+        cached_headers = cached_get.headers
+
+        head_etag = head_headers.get('ETag')
+        cached_etag = cached_headers.get('ETag')
+        if head_etag and cached_etag and head_etag != cached_etag:
+            logger.debug(
+                f'HEAD ETag {head_etag!r} does not match cached ETag {cached_etag!r}'
+            )
+            return True
+
+        head_last_modified = _parse_http_datetime(head_headers.get('Last-Modified'))
+        cached_last_modified = _parse_http_datetime(cached_headers.get('Last-Modified'))
+        if (
+            head_last_modified is not None
+            and cached_last_modified is not None
+            and head_last_modified != cached_last_modified
+        ):
+            logger.debug(
+                'HEAD Last-Modified does not match cached Last-Modified'
+            )
+            return True
+
+        # Content-Length describes the representation body, which must remain the GET body.
+        # Compare against the cached Content-Length when present, otherwise the actual body size.
+        head_length = _parse_content_length(head_headers.get('Content-Length'))
+        if head_length is not None:
+            cached_length = _parse_content_length(cached_headers.get('Content-Length'))
+            if cached_length is None and cached_get._content is not None:
+                cached_length = len(cached_get._content)
+            if cached_length is not None and head_length != cached_length:
+                logger.debug(
+                    f'HEAD Content-Length {head_length} does not match cached body length '
+                    f'{cached_length}'
+                )
+                return True
+
+        return False
+
+    @staticmethod
+    def _head_validators_agree(
+        head_headers: CaseInsensitiveDict, cached_headers: CaseInsensitiveDict
+    ) -> bool:
+        """A HEAD response can validate a cached representation only when at least one validator
+        is present on both sides and has the same value."""
+        head_etag = head_headers.get('ETag')
+        if head_etag and head_etag == cached_headers.get('ETag'):
+            return True
+
+        head_last_modified = _parse_http_datetime(head_headers.get('Last-Modified'))
+        cached_last_modified = _parse_http_datetime(cached_headers.get('Last-Modified'))
+        return (
+            head_last_modified is not None
+            and cached_last_modified is not None
+            and head_last_modified == cached_last_modified
+        )
+
+    @staticmethod
+    def _merge_head_headers(
+        head_headers: CaseInsensitiveDict, cached_headers: CaseInsensitiveDict
+    ):
+        """Merge response header fields allowed to be updated from a HEAD response into the
+        cached GET response headers. Representation body metadata and hop-by-hop headers are
+        retained from the cached response so its body stays consistent.
+        """
+        excluded = set(HOP_BY_HOP_HEADERS)
+        excluded.update(['content-length'])
+        # Headers listed in the Connection header are hop-by-hop for this connection
+        connection = head_headers.get('Connection')
+        if connection:
+            excluded.update(token.strip().lower() for token in connection.split(','))
+
+        for key, value in head_headers.items():
+            if key.lower() not in excluded:
+                cached_headers[key] = value
+
     def _update_from_cached_response_headers(self, cached_response: 'CachedResponse'):
         """Recover stale-if-error and stale-while-revalidate directives from a cached response"""
         directives = CacheDirectives.from_headers(cached_response.headers)
@@ -356,11 +528,29 @@ class CacheActions(RichMixin):
         self, cached_response: 'CachedResponse', create_key: KeyCallback, **key_kwargs
     ) -> bool:
         """If the cached response contains Vary, check that the specified request headers match"""
+        headers_match, match_headers = self._vary_headers_match(
+            cached_response, create_key, **key_kwargs
+        )
+        if not headers_match and match_headers is not None:
+            # Compute secondary cache key with merged Vary + user match_headers
+            key_kwargs['match_headers'] = self._merge_match_headers(match_headers)
+            self.vary_cache_key = create_key(self._request, **key_kwargs)
+        return headers_match
+
+    def _vary_headers_match(
+        self, cached_response: 'CachedResponse', create_key: KeyCallback, **key_kwargs
+    ) -> tuple:
+        """Check Vary request-header selection without mutating any action state.
+
+        Returns a tuple of ``(headers_match, match_headers)``; ``match_headers`` is the list of
+        request header names (minus Cookie) used for the comparison, or ``None`` when no header
+        comparison was needed.
+        """
         vary = cached_response.headers.get('Vary')
         if not vary:
-            return True
+            return True, None
         elif vary == '*':
-            return False
+            return False, None
 
         # Generate a secondary cache key based on Vary for both the cached request and new request.
         # If there are redirects, compare the new request against the last request in the chain.
@@ -375,11 +565,11 @@ class CacheActions(RichMixin):
         if 'cookie' in match_headers:
             if not self._cookies_match(vary_request):
                 logger.debug('Failed Vary check: cookies do not match')
-                return False
+                return False, None
             match_headers.remove('cookie')
 
         if not match_headers:
-            return True
+            return True, None
 
         # If a Vary header is in ignored_parameters and on the request, treat it as a cache miss
         # rather than potentially returning an invalid response
@@ -389,11 +579,13 @@ class CacheActions(RichMixin):
             logger.debug(
                 f'Failed Vary check: Vary header(s) are in ignored_parameters: {ignore_overlap}'
             )
-            return False
+            return False, None
 
         key_kwargs['match_headers'] = match_headers
         vary_key_cached = create_key(vary_request, **key_kwargs)
-        vary_key_current = create_key(self._request, **key_kwargs)
+        # A HEAD request associates with representations of the equivalent GET request (RFC 9111,
+        # section 4.3.5), so compare on the GET target rather than on the request method itself
+        vary_key_current = create_key(self._vary_selection_request(), **key_kwargs)
         headers_match = vary_key_current == vary_key_cached
         if not headers_match:
             _log_vary_diff(
@@ -401,11 +593,19 @@ class CacheActions(RichMixin):
                 vary_request.headers,
                 key_kwargs['match_headers'],
             )
-            # Compute secondary cache key with merged Vary + user match_headers
-            merged = self._merge_match_headers(match_headers)
-            key_kwargs['match_headers'] = merged
-            self.vary_cache_key = create_key(self._request, **key_kwargs)
-        return headers_match
+        return headers_match, match_headers
+
+    def _vary_selection_request(self) -> PreparedRequest:
+        """Return the request used for Vary selection-key comparison. A HEAD request selects the
+        same representations as the equivalent GET on the same target URI.
+        """
+        if (self._request.method or '').upper() == 'HEAD':
+            get_request = self._request.copy()
+            get_request.method = 'GET'
+            for override_header in METHOD_OVERRIDE_HEADERS:
+                get_request.headers.pop(override_header, None)
+            return get_request
+        return self._request
 
     def _cookies_match(self, cached_request: 'CachedRequest') -> bool:
         """Compare cookies between the current request and cached request for Vary: Cookie"""
@@ -448,6 +648,26 @@ def _is_method_allowed(request: PreparedRequest, settings: CacheSettings) -> boo
     methods = [headers.get(k) for k in METHOD_OVERRIDE_HEADERS]
     methods += [request.method]
     return any(m is not None and m in settings.allowable_methods for m in methods)
+
+
+def _parse_http_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse an HTTP-date header value (e.g. Last-Modified), returning None when absent/invalid"""
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_content_length(value: Optional[str]) -> Optional[int]:
+    """Parse a Content-Length header value, returning None when absent or malformed"""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _log_vary_diff(

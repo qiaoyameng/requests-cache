@@ -78,3 +78,33 @@ The following headers are currently supported:
 - `ETag`: Validator used for conditional requests
 - `Last-Modified`: Validator used for conditional requests
 - `Vary`: Used to indicate which request headers to match. See {ref}`matching-headers` for details.
+
+(head-updates-get)=
+## HEAD Requests
+By default, `HEAD` and `GET` responses are cached separately under method-specific cache keys.
+
+Some sites expose a `HEAD` endpoint for change detection of resources that were previously fetched
+and cached in full with `GET`. Enable the opt-in `head_updates_get` setting to let a successful
+`HEAD` response refresh the cached complete `GET` representation, following
+[RFC 9111, sections 3.4 and 4.3.5](https://www.rfc-editor.org/rfc/rfc9111#section-4.3.5):
+
+```python
+>>> session = CachedSession(head_updates_get=True)
+```
+
+Behavior for a 200 `HEAD` response, when a cached 200 `GET` representation exists for the same
+target URI with matching `Vary` request headers:
+
+* If a validator (`ETag`, or `Last-Modified`) agrees and any present `Content-Length` matches the
+  cached body, updatable response headers are merged into the cached response and its freshness is
+  recomputed. The cached `GET` body is never replaced by the empty `HEAD` payload.
+* If the evidence conflicts (a mismatched validator or `Content-Length`), the cached `GET`
+  representation is marked expired so the next `GET` goes back to the origin. Its body and other
+  metadata are left untouched.
+* Without sufficient evidence (for example, no validators), or when the `Vary` selection does not
+  match, nothing is changed.
+* Non-200 `HEAD` responses never count as successful validation and do not modify the cached
+  `GET` representation.
+
+The `HEAD` response itself always has an empty body and remains cached separately when `HEAD` is
+an allowable method.

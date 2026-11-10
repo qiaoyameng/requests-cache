@@ -4,6 +4,7 @@ from contextlib import contextmanager, nullcontext
 from logging import getLogger
 from threading import RLock, Thread
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
+from typing import List, Tuple
 
 from requests import PreparedRequest
 from requests import Session as OriginalSession
@@ -24,6 +25,11 @@ from .policy import (
     FilterCallback,
     KeyCallback,
     set_request_headers,
+)
+from .policy.actions import (
+    HEAD_CONFLICT,
+    HEAD_UPDATED,
+    METHOD_OVERRIDE_HEADERS,
 )
 from .serializers import SerializerType
 
@@ -55,6 +61,7 @@ class CacheMixin(MIXIN_BASE):
         always_revalidate: bool = False,
         ignored_parameters: Iterable[str] = DEFAULT_IGNORED_PARAMS,
         match_headers: Union[Iterable[str], bool] = False,
+        head_updates_get: bool = False,
         filter_fn: Optional[FilterCallback] = None,
         key_fn: Optional[KeyCallback] = None,
         read_only: bool = False,
@@ -73,6 +80,7 @@ class CacheMixin(MIXIN_BASE):
             always_revalidate=always_revalidate,
             ignored_parameters=ignored_parameters,
             match_headers=match_headers,
+            head_updates_get=head_updates_get,
             filter_fn=filter_fn,
             key_fn=key_fn,
             read_only=read_only,
@@ -281,6 +289,16 @@ class CacheMixin(MIXIN_BASE):
         response = super().send(request, **kwargs)
         actions.update_from_response(response)
 
+        # RFC 9111 sections 3.4 and 4.3.5: a 200 HEAD response may update the headers and
+        # freshness of an already cached, complete GET representation, but never its body
+        if (
+            self.settings.head_updates_get
+            and self._is_head_request(request)
+            and response.status_code == 200
+            and not actions.skip_write
+        ):
+            self._update_cached_get_from_head(request, response, actions, **kwargs)
+
         if not actions.skip_write:
             self.cache.save_response(response, actions.cache_key, actions.expires)
         elif cached_response is not None and response.status_code == 304:
@@ -300,6 +318,110 @@ class CacheMixin(MIXIN_BASE):
             return response
         else:
             return OriginalResponse.wrap_response(response, actions)
+
+    @staticmethod
+    def _is_head_request(request: PreparedRequest) -> bool:
+        """Check whether a request targets HEAD semantics, including method-override headers"""
+        headers = request.headers or {}
+        return request.method == 'HEAD' or any(
+            headers.get(name) == 'HEAD' for name in METHOD_OVERRIDE_HEADERS
+        )
+
+    def _update_cached_get_from_head(
+        self,
+        request: PreparedRequest,
+        head_response: OriginalResponse,
+        actions: CacheActions,
+        **kwargs,
+    ):
+        """Locate the complete GET representation associated with a HEAD request's target URI and
+        Vary selection, then apply the RFC 9111 section 4.3.5 update or conflict rules. The HEAD
+        response's empty body is never written into the GET cache entry.
+        """
+        get_request = request.copy()
+        get_request.method = 'GET'
+        # A method-override header made the original request a HEAD for cache purposes; the
+        # associated GET lookup must use the un-overridden target
+        for override_header in METHOD_OVERRIDE_HEADERS:
+            get_request.headers.pop(override_header, None)
+
+        primary_get_key = self.cache.create_key(get_request, **kwargs)
+        primary_cached = self.cache.get_response(primary_get_key)
+        candidates = self._find_cached_get_entries(
+            get_request, primary_get_key, primary_cached, actions, **kwargs
+        )
+        if not candidates:
+            logger.debug(
+                f'No cached complete GET representation to update for URL: {request.url}'
+            )
+            return
+
+        for storage_key, cached_get in candidates:
+            result = actions.update_cached_get_from_head(
+                head_response, cached_get, self.cache.create_key, **kwargs
+            )
+            if result in (HEAD_UPDATED, HEAD_CONFLICT):
+                # Persist under the storage key the entry was actually read from, so response
+                # bodies and redirect aliases stay consistent across in-memory and SQLite backends
+                self.cache.responses[storage_key] = cached_get
+
+    def _find_cached_get_entries(
+        self,
+        get_request: PreparedRequest,
+        primary_get_key: str,
+        primary_cached: Optional[CachedResponse],
+        actions: CacheActions,
+        **kwargs,
+    ) -> List[Tuple[str, CachedResponse]]:
+        """Collect every stored 200 GET entry representing the HEAD request's target URI and Vary
+        selection. Redirect chains can leave multiple storage entries (natural and alias keys)
+        for the same representation, all of which must stay consistent.
+        """
+        lookup_keys = [primary_get_key]
+        if primary_cached is not None and primary_cached.headers.get('Vary'):
+            # The primary key may hold a different Vary variant; derive the Vary-qualified key
+            # for this HEAD request's header selection from the stored response's Vary header
+            vary_headers = [
+                token.strip().lower()
+                for token in primary_cached.headers['Vary'].split(',')
+                if token.strip().lower() != 'cookie'
+            ]
+            if vary_headers:
+                match_headers = actions._merge_match_headers(vary_headers)
+                lookup_keys.append(
+                    self.cache.create_key(
+                        get_request, match_headers=match_headers, **kwargs
+                    )
+                )
+
+        candidates = []
+        seen_keys = set()
+        candidate_keys = set(lookup_keys)
+        # Add alias entries (redirect chains) resolving to any of the matching responses
+        for alias_key, target_key in list(self.cache.redirects.items()):
+            if target_key in candidate_keys:
+                candidate_keys.add(alias_key)
+
+        # Redirect chains can also store a second standalone entry keyed by the redirect request
+        # (with the alias pointing at itself), so additionally scan by target URI. Entries are
+        # still constrained below by the policy-level Vary selection check.
+        for storage_key in list(self.cache.responses.keys()):
+            if storage_key not in candidate_keys:
+                cached = self.cache.responses[storage_key]
+                if (
+                    getattr(cached, 'status_code', None) == 200
+                    and cached.url == get_request.url
+                ):
+                    candidate_keys.add(storage_key)
+
+        for storage_key in candidate_keys:
+            if storage_key in seen_keys:
+                continue
+            seen_keys.add(storage_key)
+            cached = self.cache.get_response(storage_key)
+            if cached is not None and cached.status_code == 200:
+                candidates.append((cached.cache_key or storage_key, cached))
+        return candidates
 
     def _resend(
         self,
@@ -406,6 +528,11 @@ class CachedSession(CacheMixin, OriginalSession):
             be a list of headers, or ``True`` to match all.
         ignored_parameters: Request parameters, headers, and/or JSON body params to exclude from both
             request matching and cached request data
+        head_updates_get: Use 200 responses to ``HEAD`` requests to update the headers and
+            freshness of a previously cached full ``GET`` representation for the same target URI
+            (and matching ``Vary`` request headers), while keeping the cached response body
+            unchanged. Evidence conflicts (mismatched validators or ``Content-Length``) mark the
+            cached representation as expired instead. Implements RFC 9111, sections 3.4 and 4.3.5.
         read_only: Read existing cached responses, but do not write any new responses to the cache
         stale_if_error: Return a stale response if a new request raises an exception. Optionally
             accepts a time value representing maximum staleness to accept.
