@@ -8,13 +8,14 @@
 import sqlite3
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from logging import getLogger
 from os import unlink
 from os.path import getsize, isfile
 from pathlib import Path
 from tempfile import gettempdir
 from time import sleep, time
-from typing import Collection, Iterator, List, Optional, Tuple, Type
+from typing import Any, Collection, Iterator, List, Optional, Tuple, Type
 
 from platformdirs import user_cache_dir
 
@@ -31,11 +32,30 @@ SQLITE_MAX_VARIABLE_NUMBER = 999
 logger = getLogger(__name__)
 
 
+@dataclass
+class QuarantinedItem:
+    """A corrupt cache record that was moved to the quarantine area. The raw stored value is
+    preserved as-is (never deserialized), since it may be in a dangerous format (e.g., pickle).
+    """
+
+    key: str
+    table_name: str
+    value: Any
+    format: Optional[str]
+    error: str
+    quarantined_at: float
+
+
 class SQLiteCache(BaseCache):
     """SQLite cache backend.
 
     Args:
         db_path: Database file path
+        quarantine: If ``True``, move corrupt cache items (that fail deserialization, version,
+            or response structure validation) to a separate quarantine table, and treat the
+            access as a cache miss. Quarantine records are preserved for later inspection, and
+            are only removed via :py:meth:`delete_quarantined` or :py:meth:`clear_quarantined`.
+            Default is ``False`` (previous behavior).
         use_cache_dir: Store database in a user cache directory (e.g., `~/.cache/http_cache.sqlite`)
         use_temp: Store database in a temp directory (e.g., ``/tmp/http_cache.sqlite``)
         use_memory: Store database in memory instead of in a file
@@ -53,12 +73,19 @@ class SQLiteCache(BaseCache):
         self,
         db_path: StrOrPath = 'http_cache',
         serializer: Optional[SerializerType] = None,
+        quarantine: bool = False,
         **kwargs,
     ):
         super().__init__(cache_name=str(db_path), **kwargs)
         # Only override serializer if a non-None value is specified
         skwargs = {'serializer': serializer, **kwargs} if serializer else kwargs
-        self.responses: SQLiteDict = SQLiteDict(db_path, table_name='responses', **skwargs)
+        self.responses: SQLiteDict = SQLiteDict(
+            db_path,
+            table_name='responses',
+            quarantine=quarantine,
+            quarantine_redirects_table='redirects',
+            **skwargs,
+        )
         self.redirects: SQLiteDict = SQLiteDict(
             db_path,
             table_name='redirects',
@@ -83,6 +110,20 @@ class SQLiteCache(BaseCache):
                 unlink(self.responses.db_path)
             self.responses.init_db()
             self.redirects.init_db()
+
+    def list_quarantined(self) -> List[QuarantinedItem]:
+        """List corrupt cache items that have been moved to the quarantine area (read-only).
+        Returns an empty list if quarantine mode is not enabled.
+        """
+        return self.responses.list_quarantined()
+
+    def delete_quarantined(self, *keys: str):
+        """Explicitly delete quarantine records by cache key"""
+        self.responses.delete_quarantined(*keys)
+
+    def clear_quarantined(self):
+        """Explicitly delete all quarantine records"""
+        self.responses.clear_quarantined()
 
     # A more efficient SQLite implementation of BaseCache.delete
     def delete(
@@ -199,6 +240,8 @@ class SQLiteDict(BaseStorage):
         table_name: str = 'http_cache',
         busy_timeout: Optional[int] = None,
         fast_save: bool = False,
+        quarantine: bool = False,
+        quarantine_redirects_table: Optional[str] = None,
         serializer: Optional[SerializerType] = pickle_serializer,
         use_cache_dir: bool = False,
         use_memory: bool = False,
@@ -221,6 +264,9 @@ class SQLiteDict(BaseStorage):
         self.db_path = _get_sqlite_cache_path(db_path, use_cache_dir, use_temp, use_memory)
         self.busy_timeout = busy_timeout
         self.fast_save = fast_save
+        self.quarantine = quarantine
+        self.quarantine_redirects_table = quarantine_redirects_table
+        self.quarantine_table_name = f'{table_name}_quarantine'
         self.table_name = table_name
         self.wal = wal
         self.init_db()
@@ -243,6 +289,17 @@ class SQLiteDict(BaseStorage):
                 ')'
             )
             con.execute(f'CREATE INDEX IF NOT EXISTS expires_idx ON {self.table_name}(expires)')
+            if self.quarantine:
+                con.execute(
+                    f'CREATE TABLE IF NOT EXISTS {self.quarantine_table_name} ('
+                    '    key TEXT PRIMARY KEY,'
+                    '    table_name TEXT,'
+                    '    value BLOB,'
+                    '    format TEXT,'
+                    '    error TEXT,'
+                    '    quarantined_at REAL'
+                    ')'
+                )
 
     @contextmanager
     def connection(self, commit=False) -> Iterator[sqlite3.Connection]:
@@ -395,6 +452,83 @@ class SQLiteDict(BaseStorage):
     def serialize(self, value: VT):
         value = super().serialize(value)
         return sqlite3.Binary(value) if isinstance(value, bytes) else value
+
+    def deserialize(self, key, value):
+        """Deserialize a value. In quarantine mode, any deserialization, version, or response
+        structure validation failure moves the raw record to the quarantine table (atomically
+        with any associated redirect alias cleanup) and returns ``None`` (a cache miss),
+        instead of raising an error.
+        """
+        if not self.quarantine:
+            return super().deserialize(key, value)
+        if not self.serializer:
+            return value
+
+        try:
+            obj = self.serializer.loads(value)
+            # Set cache key, if it's a response object
+            try:
+                obj.cache_key = key
+            except AttributeError:
+                pass
+            return obj
+        except Exception as e:
+            logger.error(f'Unable to deserialize response; quarantining key {key}: {e}')
+            logger.debug(e, exc_info=True)
+            self._quarantine(key, value, e)
+            return None
+
+    def _quarantine(self, key, value, error: Exception):
+        """Atomically move a corrupt row to the quarantine table, and remove any redirect
+        aliases that point to it. The raw value is preserved as-is for later inspection.
+        """
+        if isinstance(value, bytes):
+            value = sqlite3.Binary(value)
+        format_name = getattr(self.serializer, 'name', None) or (
+            str(self.serializer) if self.serializer else None
+        )
+        error_msg = f'{type(error).__name__}: {error}'
+        with self.connection(commit=True) as con:
+            con.execute(
+                f'INSERT OR REPLACE INTO {self.quarantine_table_name}'
+                '    (key, table_name, value, format, error, quarantined_at)'
+                '    VALUES (?,?,?,?,?,?)',
+                (key, self.table_name, value, format_name, error_msg, time()),
+            )
+            con.execute(f'DELETE FROM {self.table_name} WHERE key=?', (key,))
+            if self.quarantine_redirects_table:
+                con.execute(
+                    f'DELETE FROM {self.quarantine_redirects_table} WHERE value=?', (key,)
+                )
+        logger.warning(f'Quarantined corrupt cache item {key}: {error_msg}')
+
+    def list_quarantined(self) -> List[QuarantinedItem]:
+        """List quarantined records (read-only). Raw values are returned exactly as stored,
+        and are never deserialized, since they may be in a dangerous format (e.g., pickle).
+        """
+        if not self.quarantine:
+            return []
+        with self.connection() as con:
+            rows = con.execute(
+                f'SELECT key, table_name, value, format, error, quarantined_at'
+                f'  FROM {self.quarantine_table_name} ORDER BY quarantined_at'
+            ).fetchall()
+        return [QuarantinedItem(*row) for row in rows]
+
+    def delete_quarantined(self, *keys: str):
+        """Explicitly delete specific quarantine records"""
+        if not self.quarantine or not keys:
+            return
+        with self.connection(commit=True) as con:
+            marks, args = _format_sequence(keys)
+            con.execute(f'DELETE FROM {self.quarantine_table_name} WHERE key IN ({marks})', args)
+
+    def clear_quarantined(self):
+        """Explicitly delete all quarantine records"""
+        if not self.quarantine:
+            return
+        with self.connection(commit=True) as con:
+            con.execute(f'DELETE FROM {self.quarantine_table_name}')
 
     def size(self) -> int:
         """Return the size of the database, in bytes. For an in-memory database, this will be an
