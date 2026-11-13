@@ -2,6 +2,7 @@
 
 from .backends import *
 from .cache_keys import *
+from .key_migration import *
 from .models import *
 from .patcher import *
 from .policy import *

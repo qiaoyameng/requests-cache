@@ -19,6 +19,7 @@ from typing import Collection, Iterator, List, Optional, Tuple, Type
 from platformdirs import user_cache_dir
 
 from .._utils import chunkify, get_valid_kwargs
+from ..key_migration import KeyMigrationError, KeyMigrationPlan
 from ..models.response import CachedResponse
 from ..policy import ExpirationTime
 from ..serializers import SerializerType, pickle_serializer
@@ -172,6 +173,69 @@ class SQLiteCache(BaseCache):
         with self.responses.bulk_commit():
             super().recreate_keys()
 
+    def validate_key_migration_storage(self, plan: KeyMigrationPlan):
+        for storage in (self.responses, self.redirects):
+            with storage.connection() as connection:
+                indexes = {
+                    row[1]
+                    for row in connection.execute(f'PRAGMA index_list({storage.table_name})')
+                }
+                required_indexes = {'sqlite_autoindex_%s_1' % storage.table_name}
+                if storage.table_name == 'responses':
+                    required_indexes.add('expires_idx')
+                if not required_indexes.issubset(indexes):
+                    missing = sorted(required_indexes - indexes)
+                    plan.applicable = False
+                    plan.errors.append(
+                        f'Missing required SQLite index(es) on {storage.table_name}: {missing}'
+                    )
+
+    def apply_key_migration_storage(self, plan: KeyMigrationPlan):
+        new_responses: List[Tuple[str, CachedResponse, Optional[int]]] = []
+        new_redirects: List[Tuple[str, str]] = []
+        canonical_entries = {}
+        for entry in sorted(plan.response_entries, key=lambda item: item.old_key):
+            canonical_entries.setdefault(entry.new_key, entry)
+
+        for entry in canonical_entries.values():
+            response = self.responses[entry.old_key]
+            response.cache_key = entry.new_key
+            new_responses.append((entry.new_key, response, response.expires_unix))
+        for entry in plan.redirect_entries:
+            target_entry = canonical_entries[entry.new_target_key]
+            new_redirects.append((entry.new_key, target_entry.new_key))
+
+        original_redirect_connection = self.redirects._connection
+        self.redirects._connection = self.responses._connection
+        committed = False
+        try:
+            with self.responses.bulk_commit():
+                self.responses._connection.execute(
+                    f'DELETE FROM {self.responses.table_name}'
+                )
+                self.redirects._connection.execute(
+                    f'DELETE FROM {self.redirects.table_name}'
+                )
+                self.responses._connection.executemany(
+                    f'INSERT INTO {self.responses.table_name} '
+                    '(key, value, expires) VALUES (?, ?, ?)',
+                    [
+                        (key, self.responses.serialize(response), expires)
+                        for key, response, expires in new_responses
+                    ],
+                )
+                self.redirects._connection.executemany(
+                    f'INSERT INTO {self.redirects.table_name} '
+                    '(key, value, expires) VALUES (?, ?, NULL)',
+                    new_redirects,
+                )
+                committed = True
+        finally:
+            self.redirects._connection = original_redirect_connection
+        if committed:
+            original_redirect_connection.close()
+            self.redirects._connection = None
+
     def sorted(
         self,
         key: str = 'expires',
@@ -311,8 +375,9 @@ class SQLiteDict(BaseStorage):
             try:
                 yield
                 self._connection.commit()
-            except sqlite3.OperationalError:
+            except Exception:
                 self._connection.rollback()
+                raise
             finally:
                 self._active_transaction = False
 

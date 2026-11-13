@@ -20,6 +20,7 @@ from pathlib import Path
 from requests import Request, Response
 
 from ..cache_keys import create_key, redact_response
+from ..key_migration import KeyMigrationPlan, apply_key_migration, plan_key_migration
 from ..models import AnyRequest, CachedResponse
 from ..policy import DEFAULT_CACHE_NAME, CacheSettings, ExpirationTime
 from ..serializers import SerializerType, init_serializer
@@ -255,6 +256,38 @@ class BaseCache:
             if new_cache_key != old_cache_key:
                 self.responses[new_cache_key] = response
                 del self.responses[old_cache_key]
+
+    def validate_key_migration_storage(self, plan: KeyMigrationPlan):
+        """Validate backend-specific storage preconditions for a key migration."""
+
+    def plan_key_migration(self, **kwargs) -> KeyMigrationPlan:
+        """Build a key migration plan using this cache's current settings as the new rules."""
+        return plan_key_migration(self, **kwargs)
+
+    def apply_key_migration(self, plan: KeyMigrationPlan) -> KeyMigrationPlan:
+        """Apply a validated key migration plan atomically."""
+        return apply_key_migration(self, plan)
+
+    def apply_key_migration_storage(self, plan: KeyMigrationPlan):
+        """Replace all response and redirect keys described by a validated migration plan."""
+        new_responses = type(self.responses)()
+        new_redirects = type(self.redirects)()
+
+        canonical_entries = {}
+        for entry in sorted(plan.response_entries, key=lambda item: item.old_key):
+            canonical_entries.setdefault(entry.new_key, entry)
+
+        for entry in canonical_entries.values():
+            response = self.responses[entry.old_key]
+            response.cache_key = entry.new_key
+            new_responses[entry.new_key] = response
+
+        for entry in plan.redirect_entries:
+            target_entry = canonical_entries[entry.new_target_key]
+            new_redirects[entry.new_key] = target_entry.new_key
+
+        self.responses = new_responses
+        self.redirects = new_redirects
 
     # This is deprecated, but still appears in various examples online, so I'll postpone removing it
     # for awhile longer.

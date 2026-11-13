@@ -115,6 +115,43 @@ In these cases, if you want to keep using your existing cache data, you can use 
 >>> session.cache.recreate_keys()
 ```
 
+### Migrating Cache Key Rules
+When changing request matching rules for an existing cache, use the migration API instead of
+clearing the cache or calling `recreate_keys()` directly. The migration uses each cached
+`PreparedRequest` to calculate both the old and new keys, and can safely merge records that become
+equivalent under the new rules.
+
+First configure the session with the new rules, then create a plan describing the old rules:
+```python
+>>> session.settings.ignored_parameters.append('tracking_id')
+>>> plan = session.cache.plan_key_migration(old_ignored_parameters=old_ignored_parameters)
+>>> plan.applicable
+True
+>>> plan.to_dict()
+```
+
+The plan lists:
+* Response key mappings, including both base keys and `Vary`-derived keys
+* Redirect alias mappings and their target responses
+* Conflicts where multiple old records would use one new key
+* Errors that prevent migration, such as missing request data, an unknown custom `key_fn`, or
+  missing SQLite indexes
+
+Multiple records are merged only when their normalized requests and response representations are
+equivalent. Otherwise, the conflict is reported and application is blocked; one response is never
+silently selected based on traversal order.
+```python
+>>> session.cache.apply_key_migration(plan)
+```
+
+Application rechecks the cache library version and current records before writing. Memory storage
+uses a snapshot replacement, while SQLite uses a transaction, so a failure leaves the original keys
+and records usable with the previous configuration. The first version is an offline migration and
+does not provide zero-downtime concurrent access.
+
+If the cache was created with a custom key function, pass the same callable as `old_key_fn`. A
+cache using an unknown custom key function cannot be migrated.
+
 ### Cache Key Functions
 If you want to implement your own request matching, you can provide a cache key function which will
 take a {py:class}`~requests.PreparedRequest` plus optional keyword args for
